@@ -437,8 +437,12 @@ class DAQMotorApp(tk.Tk):
         # Cyclic guard (internal): require short dwell and low slope at target
         self._cyclic_last_switch_t = None
         self._cyclic_slope_ema = None
-        self._cyclic_dwell_s = 0.7           # seconds within which we avoid re-switching
-        self._cyclic_slope_limit = 8.0       # lbf/s max slope allowed to switch
+        self._cyclic_dwell_s = 0.2           # shorter dwell for faster cycles
+        self._cyclic_slope_limit = 60.0      # allow faster approach before switching
+
+        # Reference shaper for fast-but-smooth cyclic transitions (internal)
+        self._rfilt = None                   # filtered reference state
+        self._ref_rate_limit = 140.0         # lbf/s maximum reference slew
 
         # Ramp-to-target state (NEW)
         self._ramp_start_time = None
@@ -675,6 +679,44 @@ class DAQMotorApp(tk.Tk):
         ttk.Label(self.mpc_frame, text="Time (min):").grid(row=2, column=3, padx=4, sticky="e")
         ttk.Entry(self.mpc_frame, width=6, textvariable=self.ramp_time_var).grid(row=2, column=4, padx=2)
 
+        # --- Developer tuning: Cyclic guards + Reference slew ---
+        self.cyc_dwell_var = tk.DoubleVar(value=self._cyclic_dwell_s)
+        self.cyc_slope_limit_var = tk.DoubleVar(value=self._cyclic_slope_limit)
+        self.ref_rate_limit_var = tk.DoubleVar(value=self._ref_rate_limit)
+
+        def _trace_cyc_guard(*_):
+            try:
+                self._cyclic_dwell_s = max(0.0, float(self.cyc_dwell_var.get()))
+            except Exception:
+                pass
+            try:
+                self._cyclic_slope_limit = max(0.0, float(self.cyc_slope_limit_var.get()))
+            except Exception:
+                pass
+        def _trace_ref_rate(*_):
+            try:
+                self._ref_rate_limit = max(0.0, float(self.ref_rate_limit_var.get()))
+            except Exception:
+                pass
+        try:
+            self.cyc_dwell_var.trace_add('write', _trace_cyc_guard)
+            self.cyc_slope_limit_var.trace_add('write', _trace_cyc_guard)
+            self.ref_rate_limit_var.trace_add('write', _trace_ref_rate)
+        except Exception:
+            try:
+                self.cyc_dwell_var.trace('w', _trace_cyc_guard)
+                self.cyc_slope_limit_var.trace('w', _trace_cyc_guard)
+                self.ref_rate_limit_var.trace('w', _trace_ref_rate)
+            except Exception:
+                pass
+
+        ttk.Label(self.mpc_frame, text="Dwell (s):").grid(row=3, column=0, padx=4, sticky="e")
+        ttk.Entry(self.mpc_frame, width=6, textvariable=self.cyc_dwell_var).grid(row=3, column=1, padx=2)
+        ttk.Label(self.mpc_frame, text="Slope lim (lbf/s):").grid(row=3, column=2, padx=4, sticky="e")
+        ttk.Entry(self.mpc_frame, width=7, textvariable=self.cyc_slope_limit_var).grid(row=3, column=3, padx=2)
+        ttk.Label(self.mpc_frame, text="Ref slew (lbf/s):").grid(row=3, column=4, padx=4, sticky="e")
+        ttk.Entry(self.mpc_frame, width=7, textvariable=self.ref_rate_limit_var).grid(row=3, column=5, padx=2)
+
         # Model panel (DEV)
         self.model_frame = ttk.LabelFrame(self, text="Model (ARX)")
         self.model_frame.pack(pady=6, fill=tk.X, padx=16)
@@ -856,6 +898,7 @@ class DAQMotorApp(tk.Tk):
             # Arm cyclic at A
             self._cyclic_side = 'A'
             self._cyclic_target = a
+            self._rfilt = None  # reset reference filter
             # reflect in setpoint field without thread issues
             self.after(0, lambda: self.torque_setpoint_var.set(a))
             if not self.mpc_enable.get():
@@ -867,6 +910,7 @@ class DAQMotorApp(tk.Tk):
         else:
             self._cyclic_target = None
             self._cyclic_side = None
+            self._rfilt = None  # reset reference filter
             self.motor_status_var.set("Cyclic: OFF")
 
     # --- NEW: Ramp helpers ---
@@ -879,6 +923,7 @@ class DAQMotorApp(tk.Tk):
             self._ramp_start_load = None
             self._ramp_target = float(self.ramp_target_var.get())
             self._ramp_rate = None
+            self._rfilt = None  # reset reference filter
             if not self.mpc_enable.get():
                 self.motor_status_var.set(
                     f"Ramp armed to {self._ramp_target:.2f} lbf in {float(self.ramp_time_var.get()):.2f} min. Enable MPC to execute.")
@@ -890,7 +935,29 @@ class DAQMotorApp(tk.Tk):
             self._ramp_start_load = None
             self._ramp_target = None
             self._ramp_rate = None
+            self._rfilt = None  # reset reference filter
             self.motor_status_var.set("Ramp: OFF")
+
+    def _shape_reference(self, r_cmd, y_meas):
+        """Apply a simple rate limiter to the setpoint to avoid overshoot on flips.
+        Does not touch the UI variable; only returns r_eff for the controller.
+        """
+        try:
+            r_cmd = float(r_cmd)
+            y_meas = float(y_meas)
+        except Exception:
+            return r_cmd
+        if self._rfilt is None:
+            self._rfilt = y_meas
+        max_step = float(self._ref_rate_limit) * float(SAMPLE_INTERVAL)
+        err = r_cmd - self._rfilt
+        if err > max_step:
+            self._rfilt += max_step
+        elif err < -max_step:
+            self._rfilt -= max_step
+        else:
+            self._rfilt = r_cmd
+        return self._rfilt
 
     def _apply_ramp(self, lbf_raw, t):
         # Use thread-safe snapshots; never call tk .get() from background thread
@@ -1118,7 +1185,9 @@ class DAQMotorApp(tk.Tk):
                                 # UI update must occur on main thread
                                 self.after(0, lambda: self.model_lbl.set(self._model_str(A_new, B_new, self.mpc.nk)))
 
-                        u_cmd = self.mpc.step(y_meas=lbf_raw, r=r_cmd, u_prev=self.current_rpm)
+                        # Shape the setpoint for fast-but-smooth transitions
+                        r_eff = self._shape_reference(r_cmd, lbf_raw)
+                        u_cmd = self.mpc.step(y_meas=lbf_raw, r=r_eff, u_prev=self.current_rpm)
                         self.after(0, self._send_motor_command, u_cmd)
                 except Exception as e:
                     # Keep logging running; just turn MPC off and surface the error
