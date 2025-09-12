@@ -1136,9 +1136,10 @@ class DAQMotorApp(tk.Tk):
         """Visually reset the live graph without touching persistent logs."""
         try:
             # Clear in-memory plot buffers only
-            self.lbf_history.clear()
-            self.voltage_history.clear()
-            self.time_history.clear()
+            with self._hist_lock:
+                self.lbf_history.clear()
+                self.voltage_history.clear()
+                self.time_history.clear()
             # Reset graph start time so x-axis restarts from zero relative to now
             self.graph_start_time = time.time()
             # Redraw empty graph
