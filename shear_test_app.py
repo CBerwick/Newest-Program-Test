@@ -31,7 +31,8 @@ NOTE: All original control logic is intact; the new features only add UI/logic
 
 import tkinter as tk
 from tkinter import ttk, filedialog
-import threading, time, math, json, random
+import threading, time, math, json, random, os, sqlite3, queue
+from collections import deque
 import numpy as np
 
 # Optional QP solver (recommended). Fallback is analytic LS.
@@ -350,14 +351,31 @@ class DAQMotorApp(tk.Tk):
         self._last_cmd_rpm = 0.0
         self._last_cmd_time = None
 
-        # Histories (for display / export)
-        self.lbf_history, self.voltage_history, self.time_history = [], [], []
+        # Histories (for display). Use bounded deques to avoid unbounded memory growth.
+        # Full persistent logging is written to SQLite to survive crashes and long runs.
+        MAX_IN_MEMORY = 10000
+        self.lbf_history = deque(maxlen=MAX_IN_MEMORY)
+        self.voltage_history = deque(maxlen=MAX_IN_MEMORY)
+        self.time_history = deque(maxlen=MAX_IN_MEMORY)
         self.graph_start_time = time.time()
         self.update_graph_interval = 200  # ms
 
         self.log_start_time = None
-        self.log_time, self.log_voltage = [], []
-        self.log_mass_kg, self.log_force_lbf = [], []
+        # In-memory recent run buffers (bounded). Persistent storage below.
+        self.log_time = deque(maxlen=MAX_IN_MEMORY)
+        self.log_voltage = deque(maxlen=MAX_IN_MEMORY)
+        self.log_mass_kg = deque(maxlen=MAX_IN_MEMORY)
+        self.log_force_lbf = deque(maxlen=MAX_IN_MEMORY)
+
+        # Persistent logging (SQLite writer)
+        self._db_conn = None
+        self._db_queue = queue.Queue()
+        self._db_writer_thread = None
+        self._db_stop_event = threading.Event()
+        self._db_path = None
+        # DB rotation config (size in bytes). 200 MB default.
+        self._db_max_bytes = 200 * 1024 * 1024
+        self._db_rotate_count = 0
 
         # Identification capture
         self._id_running = False
@@ -373,6 +391,11 @@ class DAQMotorApp(tk.Tk):
             use_osqp=True  # try OSQP if installed
         )
         self.rls = RLS_ARX(na=len(DEFAULT_A)-1, nb=len(DEFAULT_B), nk=DEFAULT_NK, lam=0.995)
+        # Try to load default model settings from tests/smooth_ramp.json on first run
+        try:
+            self._load_default_model()
+        except Exception:
+            pass
 
         # COM motor
         pythoncom.CoInitialize()
@@ -405,6 +428,8 @@ class DAQMotorApp(tk.Tk):
 
         self._build_gui()
         self._apply_mode()  # start in Simplified mode
+        # start periodic DB UI update
+        self.after(1000, self._update_db_ui)
         self.bind("<F12>", lambda e: self._toggle_mode())
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -448,11 +473,43 @@ class DAQMotorApp(tk.Tk):
         self.mpc_frame.pack(pady=6, fill=tk.X, padx=16)
         self.mpc_enable = tk.BooleanVar(value=False)
         self.torque_setpoint_var = tk.DoubleVar(value=0.0)
+        # Keep thread-safe Python snapshots of Tk variables so background threads
+        # don't call tk.Variable.get() (tk is not thread-safe). Update via trace.
+        # torque setpoint
+        self._last_torque_setpoint = float(self.torque_setpoint_var.get())
+        def _trace_setpoint(*args):
+            try:
+                self._last_torque_setpoint = float(self.torque_setpoint_var.get())
+            except Exception:
+                pass
+        try:
+            self.torque_setpoint_var.trace_add('write', _trace_setpoint)
+        except Exception:
+            try:
+                self.torque_setpoint_var.trace('w', _trace_setpoint)
+            except Exception:
+                pass
+
+        # mpc_enable
+        self._last_mpc_enable = bool(self.mpc_enable.get())
+        def _trace_mpc_enable(*args):
+            try:
+                self._last_mpc_enable = bool(self.mpc_enable.get())
+            except Exception:
+                pass
+        try:
+            self.mpc_enable.trace_add('write', _trace_mpc_enable)
+        except Exception:
+            try:
+                self.mpc_enable.trace('w', _trace_mpc_enable)
+            except Exception:
+                pass
         self.Np_var = tk.IntVar(value=self.mpc.Np)
         self.Nu_var = tk.IntVar(value=self.mpc.Nu)
         self.qy_var = tk.DoubleVar(value=self.mpc.qy)
         self.rdu_var = tk.DoubleVar(value=self.mpc.rdu)
-        self.adapt_var = tk.BooleanVar(value=True)
+        # Start RLS automatic adjustment UNCHECKED by default on first run
+        self.adapt_var = tk.BooleanVar(value=False)
 
         ttk.Checkbutton(self.mpc_frame, text="Enable MPC", variable=self.mpc_enable).grid(row=0, column=0, padx=4)
         ttk.Label(self.mpc_frame, text="Setpoint (lbf):").grid(row=0, column=1, padx=4)
@@ -473,6 +530,45 @@ class DAQMotorApp(tk.Tk):
         self.cyclic_b_var = tk.DoubleVar(value=10.0)
         self.cyclic_tol_var = tk.DoubleVar(value=1.0)
 
+        # cyclic snapshots
+        self._last_cyclic = bool(self.cyclic_var.get())
+        self._last_cyclic_a = float(self.cyclic_a_var.get())
+        self._last_cyclic_b = float(self.cyclic_b_var.get())
+        self._last_cyclic_tol = float(self.cyclic_tol_var.get())
+        def _trace_cyclic(*args):
+            try:
+                self._last_cyclic = bool(self.cyclic_var.get())
+            except Exception:
+                pass
+        def _trace_cyclic_a(*args):
+            try:
+                self._last_cyclic_a = float(self.cyclic_a_var.get())
+            except Exception:
+                pass
+        def _trace_cyclic_b(*args):
+            try:
+                self._last_cyclic_b = float(self.cyclic_b_var.get())
+            except Exception:
+                pass
+        def _trace_cyclic_tol(*args):
+            try:
+                self._last_cyclic_tol = float(self.cyclic_tol_var.get())
+            except Exception:
+                pass
+        try:
+            self.cyclic_var.trace_add('write', _trace_cyclic)
+            self.cyclic_a_var.trace_add('write', _trace_cyclic_a)
+            self.cyclic_b_var.trace_add('write', _trace_cyclic_b)
+            self.cyclic_tol_var.trace_add('write', _trace_cyclic_tol)
+        except Exception:
+            try:
+                self.cyclic_var.trace('w', _trace_cyclic)
+                self.cyclic_a_var.trace('w', _trace_cyclic_a)
+                self.cyclic_b_var.trace('w', _trace_cyclic_b)
+                self.cyclic_tol_var.trace('w', _trace_cyclic_tol)
+            except Exception:
+                pass
+
         ttk.Checkbutton(self.mpc_frame, text="Cyclic (A ↔ B)", variable=self.cyclic_var,
                         command=self._on_cyclic_toggle).grid(row=1, column=0, padx=4, sticky="w")
         ttk.Label(self.mpc_frame, text="A (lbf):").grid(row=1, column=1, padx=4, sticky="e")
@@ -486,6 +582,26 @@ class DAQMotorApp(tk.Tk):
         self.ramp_var = tk.BooleanVar(value=False)
         self.ramp_target_var = tk.DoubleVar(value=0.0)
         self.ramp_time_var = tk.DoubleVar(value=1.0)
+        # ramp snapshots (for simplified UI read by background thread if needed)
+        self._last_ramp = bool(self.ramp_var.get())
+        self._last_ramp_target = float(self.ramp_target_var.get())
+        self._last_ramp_time = float(self.ramp_time_var.get())
+        def _trace_ramp(*args):
+            try:
+                self._last_ramp = bool(self.ramp_var.get())
+                self._last_ramp_target = float(self.ramp_target_var.get())
+                self._last_ramp_time = float(self.ramp_time_var.get())
+            except Exception:
+                pass
+        try:
+            self.ramp_var.trace_add('write', _trace_ramp)
+            self.ramp_target_var.trace_add('write', _trace_ramp)
+            self.ramp_time_var.trace_add('write', _trace_ramp)
+        except Exception:
+            try:
+                self.ramp_var.trace('w', _trace_ramp)
+            except Exception:
+                pass
         ttk.Checkbutton(self.mpc_frame, text="Ramp to Target", variable=self.ramp_var,
                         command=self._on_ramp_toggle).grid(row=2, column=0, padx=4, sticky="w")
         ttk.Label(self.mpc_frame, text="Target (lbf):").grid(row=2, column=1, padx=4, sticky="e")
@@ -525,13 +641,48 @@ class DAQMotorApp(tk.Tk):
         ttk.Label(self.spd_frame, textvariable=self.speed_display_var).grid(row=0, column=2, padx=5)
         self._update_speed_display()
 
+        # Simplified MPC controls (minimal setpoint + cyclic) - shown in Simplified mode
+        self.simple_mpc_frame = ttk.Frame(self)
+        ttk.Label(self.simple_mpc_frame, text="Setpoint (lbf):").grid(row=0, column=0, padx=4, sticky="e")
+        ttk.Entry(self.simple_mpc_frame, width=8, textvariable=self.torque_setpoint_var).grid(row=0, column=1, padx=2)
+        ttk.Checkbutton(self.simple_mpc_frame, text="Enable MPC", variable=self.mpc_enable).grid(row=0, column=2, padx=6)
+
+        # Cyclic minimal inputs
+        ttk.Checkbutton(self.simple_mpc_frame, text="Cyclic (A↔B)", variable=self.cyclic_var,
+                        command=self._on_cyclic_toggle).grid(row=1, column=0, padx=4, sticky="w")
+        ttk.Label(self.simple_mpc_frame, text="A:").grid(row=1, column=1, padx=2, sticky="e")
+        ttk.Entry(self.simple_mpc_frame, width=7, textvariable=self.cyclic_a_var).grid(row=1, column=2, padx=2)
+        ttk.Label(self.simple_mpc_frame, text="B:").grid(row=1, column=3, padx=2, sticky="e")
+        ttk.Entry(self.simple_mpc_frame, width=7, textvariable=self.cyclic_b_var).grid(row=1, column=4, padx=2)
+        ttk.Label(self.simple_mpc_frame, text="Tol:").grid(row=1, column=5, padx=2, sticky="e")
+        ttk.Entry(self.simple_mpc_frame, width=6, textvariable=self.cyclic_tol_var).grid(row=1, column=6, padx=2)
+        # Reset Graph button (visual only)
+        ttk.Button(self.simple_mpc_frame, text="Reset Graph", command=self.reset_graph).grid(row=0, column=7, padx=6)
+
+        # Simplified Ramp-to-target controls (reuse existing vars/handlers)
+        ttk.Checkbutton(self.simple_mpc_frame, text="Ramp to Target", variable=self.ramp_var,
+                        command=self._on_ramp_toggle).grid(row=2, column=0, padx=4, sticky="w")
+        ttk.Label(self.simple_mpc_frame, text="Target(lbf):").grid(row=2, column=1, padx=2, sticky="e")
+        ttk.Entry(self.simple_mpc_frame, width=7, textvariable=self.ramp_target_var).grid(row=2, column=2, padx=2)
+        ttk.Label(self.simple_mpc_frame, text="Time(min):").grid(row=2, column=3, padx=2, sticky="e")
+        ttk.Entry(self.simple_mpc_frame, width=6, textvariable=self.ramp_time_var).grid(row=2, column=4, padx=2)
+
         # Status (both modes)
         status = "Motor: OK" if self.mnt_ctrl else self.motor_error_msg
         self.motor_status_var = tk.StringVar(value=status)
         self.status_label = ttk.Label(self, textvariable=self.motor_status_var, font=("Arial", 12))
         self.status_label.pack(pady=4)
 
-        # Motor controls (both; Disable = DEV)
+        # Recovery UI: show active DB and queue length, and allow opening logs folder
+        self.recovery_frame = ttk.Frame(self)
+        self.recovery_frame.pack(pady=2)
+        self.db_status_var = tk.StringVar(value="DB: none")
+        ttk.Label(self.recovery_frame, textvariable=self.db_status_var).pack(side=tk.LEFT, padx=6)
+        self.db_queue_var = tk.StringVar(value="Queue: 0")
+        ttk.Label(self.recovery_frame, textvariable=self.db_queue_var).pack(side=tk.LEFT, padx=6)
+        ttk.Button(self.recovery_frame, text="Open Logs", command=lambda: os.startfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs'))).pack(side=tk.LEFT, padx=6)
+
+        # Motor controls (both)
         self.mbtn_frame = ttk.Frame(self); self.mbtn_frame.pack(pady=4, fill=tk.X, padx=16)
         self.btn_enable_motor = ttk.Button(self.mbtn_frame, text="Enable Motor", command=self.enable_motor)
         self.btn_enable_motor.grid(row=0, column=0, padx=4)
@@ -551,8 +702,11 @@ class DAQMotorApp(tk.Tk):
             self.display_frame, self.sep_main,
             self.mpc_frame, self.model_frame
         ]
-        self._dev_buttons_pack = [self.btn_stop_daq]          # pack manager
-        self._dev_buttons_grid = [self.btn_disable_motor]     # grid manager
+        # Keep Stop DAQ visible in Simplified mode; no DEV-only packed buttons
+        self._dev_buttons_pack = []          # pack manager
+        self._dev_buttons_grid = []     # grid manager (leave motor enable/disable visible in Simplified)
+        # Track simplified-only widgets to show/hide with mode
+        self._simplified_frames = [self.simple_mpc_frame]
 
     # Mode switching logic (NEW)
     def _apply_mode(self):
@@ -575,6 +729,9 @@ class DAQMotorApp(tk.Tk):
                 self.graph_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=8)                
             if not self.spd_frame.winfo_ismapped():
                 self.spd_frame.pack(pady=4, fill=tk.X, padx=16)
+            # show simplified MPC controls
+            if not self.simple_mpc_frame.winfo_ismapped():
+                self.simple_mpc_frame.pack(pady=4, fill=tk.X, padx=16)
             if not self.status_label.winfo_ismapped():
                 self.status_label.pack(pady=4)
             if not self.mbtn_frame.winfo_ismapped():
@@ -594,6 +751,12 @@ class DAQMotorApp(tk.Tk):
                 self.sep_main.pack(fill="x", pady=6)
             if not self.mpc_frame.winfo_ismapped():
                 self.mpc_frame.pack(pady=6, fill=tk.X, padx=16)
+            # hide simplified-only frame
+            try:
+                if self.simple_mpc_frame.winfo_ismapped():
+                    self.simple_mpc_frame.pack_forget()
+            except Exception:
+                pass
             if not self.model_frame.winfo_ismapped():
                 self.model_frame.pack(pady=6, fill=tk.X, padx=16)
             if not self.graph_frame.winfo_ismapped():
@@ -695,8 +858,18 @@ class DAQMotorApp(tk.Tk):
         self.daq.start(cfg)
         self.log_start_time = self.daq.t0
         self.graph_start_time = self.daq.t0
-        self.log_time, self.log_voltage = [], []
-        self.log_mass_kg, self.log_force_lbf = [], []
+        # clear in-memory buffers
+        self.log_time.clear(); self.log_voltage.clear()
+        self.log_mass_kg.clear(); self.log_force_lbf.clear()
+        self.lbf_history.clear(); self.voltage_history.clear(); self.time_history.clear()
+
+        # Prepare persistent DB for this run
+        logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        db_fname = f'readings_{ts}.db'
+        self._db_path = os.path.join(logs_dir, db_fname)
+        self._start_db_writer(self._db_path)
         self.reading = True
         self.read_thread = threading.Thread(target=self._loop, daemon=True)
         self.read_thread.start()
@@ -709,6 +882,8 @@ class DAQMotorApp(tk.Tk):
             self.read_thread = None
         if hasattr(self, "daq"):
             self.daq.stop()
+        # Stop DB writer (flush remaining rows) before prompting save
+        self._stop_db_writer()
         self._prompt_save_data()
         # Clear the graph so a new run starts fresh
         self.lbf_history.clear()
@@ -729,27 +904,52 @@ class DAQMotorApp(tk.Tk):
                 continue
             ts, data = block
             for t, volts in zip(ts, data[:, 0]):
-                dt = t - last_t
-                last_t = t
-                if dt > WATCHDOG_DT_MAX:
-                    self.after(0, self._watchdog_trip, dt)
+                try:
+                    dt = t - last_t
+                    last_t = t
+                    if dt > WATCHDOG_DT_MAX:
+                        self.after(0, self._watchdog_trip, dt)
+                        continue
+
+                    voltage_buffer.append(volts)
+                    if len(voltage_buffer) > ROLLING_PERIOD:
+                        voltage_buffer.pop(0)
+                    avg_volts = sum(voltage_buffer) / len(voltage_buffer)
+
+                    lbf_raw = volts_to_force_lbf(volts)
+                    lbf_disp = volts_to_force_lbf(avg_volts)  # UI only
+
+                    # also keep bounded in-memory buffers for plotting
+                    self.voltage_history.append(avg_volts)
+                    self.lbf_history.append(lbf_disp)
+                    self.time_history.append(t - self.graph_start_time)
+
+                    if self.log_start_time is not None:
+                        # keep run-level logs
+                        self.log_time.append(t - self.log_start_time)
+                        self.log_voltage.append(volts)
+                        self.log_force_lbf.append(lbf_disp)
+                        self.log_mass_kg.append(lbf_disp / 2.20462)
+
+                        # enqueue to persistent DB after values computed
+                        try:
+                            self._db_queue.put_nowait((t, float(volts), float(lbf_disp), float(lbf_disp/2.20462), float(self.current_rpm)))
+                        except Exception:
+                            # queue full or stopped; surface status but keep running
+                            try:
+                                self.after(0, self.motor_status_var.set, "DB queue error")
+                            except Exception:
+                                pass
+
+                    # update UI label (always display pounds-force)
+                    self.after(0, self.label_var.set, f"{lbf_disp:.2f} lbf")
+                except Exception as ex_sample:
+                    # Per-sample exception should not stop reading; report and continue
+                    try:
+                        self.after(0, self.motor_status_var.set, f"Sample error: {ex_sample}")
+                    except Exception:
+                        pass
                     continue
-
-                if self.log_start_time is not None:
-                    self.log_time.append(t - self.log_start_time)
-                    self.log_voltage.append(volts)
-
-                voltage_buffer.append(volts)
-                if len(voltage_buffer) > ROLLING_PERIOD:
-                    voltage_buffer.pop(0)
-                avg_volts = sum(voltage_buffer) / len(voltage_buffer)
-
-                lbf_raw = volts_to_force_lbf(volts)
-                lbf_disp = volts_to_force_lbf(avg_volts)  # UI only
-
-                self.voltage_history.append(avg_volts)
-                self.lbf_history.append(lbf_disp)
-                self.time_history.append(t - self.graph_start_time)
 
                 # mode = self.read_mode_var.get()
                 # if mode == "Pounds-Force":
@@ -771,31 +971,32 @@ class DAQMotorApp(tk.Tk):
                     self.log_force_lbf.append(lbf_disp)
                     self.log_mass_kg.append(lbf_disp / 2.20462)
 
-                r_cmd = self.torque_setpoint_var.get()
+                # Read the thread-safe snapshot instead of calling tk.get() here
+                r_cmd = getattr(self, '_last_torque_setpoint', 0.0)
                 ramp_cmd = self._apply_ramp(lbf_raw, t)
                 if ramp_cmd is not None:
                     r_cmd = ramp_cmd
-                elif self.cyclic_var.get() and self.mpc_enable.get():
+                elif getattr(self, '_last_cyclic', False) and getattr(self, '_last_mpc_enable', False):
                     if self._cyclic_target is None or self._cyclic_side not in ('A','B'):
                         self._cyclic_side = 'A'
-                        self._cyclic_target = float(self.cyclic_a_var.get())
+                        self._cyclic_target = float(getattr(self, '_last_cyclic_a', self.cyclic_a_var.get()))
                         self.after(0, lambda: self.torque_setpoint_var.set(self._cyclic_target))
-                    tol = abs(float(self.cyclic_tol_var.get()))
+                    tol = abs(float(getattr(self, '_last_cyclic_tol', self.cyclic_tol_var.get())))
                     if self._cyclic_side == 'A':
-                        a = float(self.cyclic_a_var.get())
+                        a = float(getattr(self, '_last_cyclic_a', self.cyclic_a_var.get()))
                         if abs(lbf_raw - a) <= tol:
                             self._cyclic_side = 'B'
-                            self._cyclic_target = float(self.cyclic_b_var.get())
+                            self._cyclic_target = float(getattr(self, '_last_cyclic_b', self.cyclic_b_var.get()))
                             self.after(0, lambda: self.torque_setpoint_var.set(self._cyclic_target))
                             self.after(0, lambda: self.motor_status_var.set(
                                 f"Cyclic: reached A≈{a:.2f} lbf → switching to B={self._cyclic_target:.2f} lbf"))
                         else:
                             self._cyclic_target = a
                     else:
-                        b = float(self.cyclic_b_var.get())
+                        b = float(getattr(self, '_last_cyclic_b', self.cyclic_b_var.get()))
                         if abs(lbf_raw - b) <= tol:
                             self._cyclic_side = 'A'
-                            self._cyclic_target = float(self.cyclic_a_var.get())
+                            self._cyclic_target = float(getattr(self, '_last_cyclic_a', self.cyclic_a_var.get()))
                             self.after(0, lambda: self.torque_setpoint_var.set(self._cyclic_target))
                             self.after(0, lambda: self.motor_status_var.set(
                                 f"Cyclic: reached B≈{b:.2f} lbf → switching to A={self._cyclic_target:.2f} lbf"))
@@ -868,6 +1069,28 @@ class DAQMotorApp(tk.Tk):
 
         self.canvas.draw()
         self.after(self.update_graph_interval, self._schedule_plot)
+
+    def reset_graph(self):
+        """Visually reset the live graph without touching persistent logs."""
+        try:
+            # Clear in-memory plot buffers only
+            self.lbf_history.clear()
+            self.voltage_history.clear()
+            self.time_history.clear()
+            # Reset graph start time so x-axis restarts from zero relative to now
+            self.graph_start_time = time.time()
+            # Redraw empty graph
+            self.ax.clear()
+            self.ax.set_title('Live Force / Voltage')
+            self.ax.set_xlabel('Time (s)')
+            self.ax.set_ylabel('Value')
+            self.canvas.draw()
+            self.motor_status_var.set('Graph reset (visual only)')
+        except Exception as e:
+            try:
+                self.motor_status_var.set(f'Graph reset failed: {e}')
+            except Exception:
+                pass
 
     # --- Safety / motor ---
     def _send_motor_command(self, desired_rpm):
@@ -1105,6 +1328,31 @@ class DAQMotorApp(tk.Tk):
         with open(fname,"w") as f: json.dump(m, f, indent=2)
         self.motor_status_var.set("Model saved.")
 
+    def _load_default_model(self):
+        """Load model from tests/smooth_ramp.json if present (silent on failure)."""
+        # locate file relative to script/workspace
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        default_path = os.path.join(base_dir, 'tests', 'smooth_ramp.json')
+        if not os.path.isfile(default_path):
+            return
+        with open(default_path, 'r') as f:
+            try:
+                m = json.load(f)
+            except Exception:
+                return
+        # apply to MPC and RLS
+        try:
+            self.mpc.set_model(m.get('dt', DEFAULT_DT), m['A'], m['B'], m.get('nk', 0))
+            self.rls = RLS_ARX(na=len(m['A'])-1, nb=len(m['B']), nk=m.get('nk', 0), lam=0.995)
+            # update UI strings
+            try:
+                self.model_lbl.set(self._model_str())
+            except Exception:
+                pass
+            self.motor_status_var.set('Default model loaded from tests/smooth_ramp.json')
+        except Exception:
+            return
+
     def _reset_model(self):
         self.mpc.set_model(DEFAULT_DT, DEFAULT_A, DEFAULT_B, DEFAULT_NK)
         self.rls = RLS_ARX(na=len(DEFAULT_A)-1, nb=len(DEFAULT_B), nk=DEFAULT_NK, lam=0.995)
@@ -1119,22 +1367,179 @@ class DAQMotorApp(tk.Tk):
 
     # --- Save & Close ---
     def _prompt_save_data(self):
-        if not self.log_time: return
+        # Export logged data. Prefer exporting from persistent DB if available.
         try:
             import pandas as pd
         except Exception:
+            self.motor_status_var.set('Pandas not installed: cannot export data')
             return
+
         fname = filedialog.asksaveasfilename(defaultextension=".xlsx",
                     filetypes=[("Excel files","*.xlsx"),("All files","*.*")])
-        if not fname: return
-        df = __import__('pandas').DataFrame({
-            "Time (s)": self.log_time,
-            "Voltage (V)": self.log_voltage,
-            "Force (lbf)": self.log_force_lbf,
-            "Torque (kg)": self.log_mass_kg,
-        })
+        if not fname:
+            return
+
+        # If DB exists, gather from all rotated DB parts in the logs folder
+        if self._db_path:
+            try:
+                base_dir = os.path.dirname(self._db_path)
+                base_name = os.path.splitext(os.path.basename(self._db_path))[0]
+                # gather files: base + .partN.db
+                candidates = []
+                base_file = os.path.join(base_dir, f"{base_name}.db")
+                if os.path.isfile(base_file):
+                    candidates.append(base_file)
+                # check for part files
+                for i in range(1, self._db_rotate_count + 1):
+                    p = os.path.join(base_dir, f"{base_name}.part{i}.db")
+                    if os.path.isfile(p):
+                        candidates.append(p)
+
+                if candidates:
+                    dfs = []
+                    for p in candidates:
+                        try:
+                            con = sqlite3.connect(p)
+                            dfp = pd.read_sql_query('SELECT timestamp AS "Time (s)", voltage AS "Voltage (V)", force_lbf AS "Force (lbf)", mass_kg AS "Torque (kg)" FROM readings ORDER BY id', con)
+                            con.close()
+                            dfs.append(dfp)
+                        except Exception:
+                            continue
+                    if dfs:
+                        df = pd.concat(dfs, ignore_index=True)
+                        df.to_excel(fname, index=False)
+                        self.motor_status_var.set(f'Data exported to {os.path.basename(fname)}')
+                        return
+            except Exception:
+                pass
+
+        # If no DB, export from in-memory buffers
         try:
+            df = pd.DataFrame({
+                "Time (s)": list(self.log_time),
+                "Voltage (V)": list(self.log_voltage),
+                "Force (lbf)": list(self.log_force_lbf),
+                "Torque (kg)": list(self.log_mass_kg),
+            })
             df.to_excel(fname, index=False)
+            self.motor_status_var.set(f'Data exported to {os.path.basename(fname)}')
+        except Exception:
+            self.motor_status_var.set('Export failed')
+
+    # --- Persistent DB writer management ---
+    def _start_db_writer(self, db_path):
+        try:
+            # Open DB and create table
+            conn = sqlite3.connect(db_path, check_same_thread=False)
+            cur = conn.cursor()
+            cur.execute('''CREATE TABLE IF NOT EXISTS readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL,
+                voltage REAL,
+                force_lbf REAL,
+                mass_kg REAL,
+                rpm REAL
+            )''')
+            conn.commit()
+            self._db_conn = conn
+            self._db_path = db_path
+            self._db_rotate_count = 0
+
+            # Start writer thread
+            self._db_stop_event.clear()
+            t = threading.Thread(target=self._db_writer_loop, daemon=True)
+            self._db_writer_thread = t
+            t.start()
+        except Exception as e:
+            self.motor_status_var.set(f'DB writer start failed: {e}')
+
+    def _stop_db_writer(self):
+        # Signal stop and wait for queue to flush
+        try:
+            if self._db_writer_thread is None:
+                return
+            self._db_stop_event.set()
+            # wait until queue empty or timeout
+            start = time.time()
+            while not self._db_queue.empty() and (time.time() - start) < 5.0:
+                time.sleep(0.05)
+            # join thread
+            self._db_writer_thread.join(timeout=2.0)
+            if self._db_conn:
+                try:
+                    self._db_conn.commit()
+                    self._db_conn.close()
+                except Exception:
+                    pass
+            self._db_writer_thread = None
+            self._db_conn = None
+        except Exception:
+            pass
+
+    def _db_writer_loop(self):
+        conn = self._db_conn
+        cur = conn.cursor()
+        while not self._db_stop_event.is_set() or not self._db_queue.empty():
+            try:
+                item = self._db_queue.get(timeout=0.2)
+            except Exception:
+                continue
+            try:
+                ts, volts, force_lbf, mass_kg, rpm = item
+                cur.execute('INSERT INTO readings (timestamp, voltage, force_lbf, mass_kg, rpm) VALUES (?, ?, ?, ?, ?)',
+                            (ts, volts, force_lbf, mass_kg, rpm))
+            except Exception:
+                pass
+            # periodic commit for durability
+            if int(time.time()) % 2 == 0:
+                try:
+                    conn.commit()
+                except Exception:
+                    pass
+            # Check rotation by file size
+            try:
+                if self._db_path and os.path.isfile(self._db_path):
+                    if os.path.getsize(self._db_path) > self._db_max_bytes:
+                        # rotate DB: close current and open a new one with suffix
+                        try:
+                            conn.commit()
+                        except Exception:
+                            pass
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        self._db_rotate_count += 1
+                        base_dir = os.path.dirname(self._db_path)
+                        base_name = os.path.splitext(os.path.basename(self._db_path))[0]
+                        new_name = f"{base_name}.part{self._db_rotate_count}.db"
+                        new_path = os.path.join(base_dir, new_name)
+                        # create new DB and switch
+                        try:
+                            conn = sqlite3.connect(new_path, check_same_thread=False)
+                            cur = conn.cursor()
+                            cur.execute('''CREATE TABLE IF NOT EXISTS readings (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                timestamp REAL,
+                                voltage REAL,
+                                force_lbf REAL,
+                                mass_kg REAL,
+                                rpm REAL
+                            )''')
+                            conn.commit()
+                            self._db_conn = conn
+                            self._db_path = new_path
+                        except Exception as e:
+                            # if rotation failed, try to reopen old path
+                            try:
+                                conn = sqlite3.connect(self._db_path, check_same_thread=False)
+                                cur = conn.cursor()
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+        try:
+            conn.commit()
         except Exception:
             pass
 
@@ -1143,6 +1548,23 @@ class DAQMotorApp(tk.Tk):
         txt = tk.Text(win, width=90, height=28)
         txt.insert("1.0", text); txt.configure(state="disabled"); txt.pack(padx=10, pady=10)
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=6)
+
+    def _update_db_ui(self):
+        # Update DB status and queue length every second
+        try:
+            if self._db_path:
+                name = os.path.basename(self._db_path)
+            else:
+                name = 'none'
+            self.db_status_var.set(f"DB: {name}")
+            qlen = self._db_queue.qsize() if self._db_queue is not None else 0
+            self.db_queue_var.set(f"Queue: {qlen}")
+        except Exception:
+            pass
+        try:
+            self.after(1000, self._update_db_ui)
+        except Exception:
+            pass
 
     def _format_arx_summary(self, model):
         lines = []
