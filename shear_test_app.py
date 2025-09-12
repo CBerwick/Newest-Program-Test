@@ -35,27 +35,27 @@ import threading, time, math, json, random, os, sqlite3, queue
 from collections import deque
 import numpy as np
 
-# Optional QP solver (recommended). Fallback is analytic LS.
+# ------------- Optional QP solver (recommended). Fallback is analytic LS. ------------- 
 try:
     import osqp  # pip install osqp
     _HAS_OSQP = True
 except Exception:
     _HAS_OSQP = False
 
-# Optional for quick TF printing (not required)
+# ------------- Optional for quick TF printing (not required) ------------- 
 try:
     import control as ct
 except Exception:
     ct = None
 
-# Hardware / DAQ
+# ------------- Hardware / DAQ ------------- 
 from mcculw import ul
 from mcculw.enums import ULRange
 import win32com.client
 import pythoncom
 from daq_stream import DaqStream, DaqConfig
 
-# Plotting
+# ------------- Plotting ------------- 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
@@ -65,28 +65,42 @@ AXIS_ID = 0
 DEGREES_PER_STEP = 36.0
 DEFAULT_JOG_RPM = 5
 
-# ARX bootstrap (your 30 rpm result)
+# ------------- ARX bootstrap (your 30 rpm result) ------------- 
 DEFAULT_DT = 0.05
 DEFAULT_NK = 0
 DEFAULT_A = [1.0, -0.9977585018924905]
 DEFAULT_B = [0.0027434762818458382, -0.0020121025585734986]
 
-# Safety & timing
+# ------------- Safety & timing -------------
 SAFETY_MAX_RPM = 30.0
 SLEW_RATE_RPM_S = 120.0
 COMMAND_DEADBAND_RPM = 0.2
 SAMPLE_INTERVAL = 0.1
 WATCHDOG_DT_MAX = SAMPLE_INTERVAL * 10.0
 
-# DAQ
+# ------------- Setpoint Initial Values -------------
+# Base SETPOINT when MPC is enabled
+SETPOINT_INITIAL = 50.0  # lbf
+
+# ------------- Cyclic mode (A↔B) defaults ------------- 
+CYCLIC_A_INITIAL = 45.0  # lbf
+CYCLIC_B_INITIAL = 155.0  # lbf
+CYCLIC_TOLERANCE = 5.0   # lbf
+
+# ------------- Ramp mode defaults ------------- 
+RAMP_TARGET_INITIAL = 800.0  # lbf
+RAMP_TIME_INITIAL = 2.5      # minutes
+
+
+# ------------- DAQ ------------- 
 BOARD_NUM = 0
 CHANNEL = 0
 VOLTAGE_RANGE = ULRange.BIP10VOLTS
 
-# Display smoothing (UI only; MPC uses raw)
+# ------------- Display smoothing (UI only; MPC uses raw) ------------- 
 ROLLING_PERIOD = int(0.5 / SAMPLE_INTERVAL)
 
-# Calibration (signed)
+# ------------- Calibration (signed) ------------- 
 def volts_to_force_lbf(v):
     # Adjust the offset if needed; this is your prior slope/offset without abs()
     return 261.19447705 * v + 0.00785081
@@ -320,9 +334,9 @@ class RLS_ARX:
 
         # 2) RLS math
         Pphi = self.P @ phi
-        alpha = float(self.lam + phi.T @ Pphi)
+        alpha = float(self.lam + (phi.T @ Pphi).item())
         K = Pphi / alpha
-        y_hat = float(phi.T @ self.theta)
+        y_hat = float((phi.T @ self.theta).item())
         eps = float(y - y_hat)
         self.theta = self.theta + K * eps
         self.P = (self.P - K @ phi.T @ self.P) / self.lam
@@ -354,6 +368,7 @@ class DAQMotorApp(tk.Tk):
         # Histories (for display). Use bounded deques to avoid unbounded memory growth.
         # Full persistent logging is written to SQLite to survive crashes and long runs.
         MAX_IN_MEMORY = 10000
+        self._hist_lock = threading.Lock()
         self.lbf_history = deque(maxlen=MAX_IN_MEMORY)
         self.voltage_history = deque(maxlen=MAX_IN_MEMORY)
         self.time_history = deque(maxlen=MAX_IN_MEMORY)
@@ -472,7 +487,7 @@ class DAQMotorApp(tk.Tk):
         self.mpc_frame = ttk.LabelFrame(self, text="MPC Settings")
         self.mpc_frame.pack(pady=6, fill=tk.X, padx=16)
         self.mpc_enable = tk.BooleanVar(value=False)
-        self.torque_setpoint_var = tk.DoubleVar(value=0.0)
+        self.torque_setpoint_var = tk.DoubleVar(value=SETPOINT_INITIAL)
         # Keep thread-safe Python snapshots of Tk variables so background threads
         # don't call tk.Variable.get() (tk is not thread-safe). Update via trace.
         # torque setpoint
@@ -572,9 +587,9 @@ class DAQMotorApp(tk.Tk):
 
         # --- NEW: Cyclic A↔B controls ---
         self.cyclic_var = tk.BooleanVar(value=False)
-        self.cyclic_a_var = tk.DoubleVar(value=5.0)
-        self.cyclic_b_var = tk.DoubleVar(value=10.0)
-        self.cyclic_tol_var = tk.DoubleVar(value=1.0)
+        self.cyclic_a_var = tk.DoubleVar(value=CYCLIC_A_INITIAL)
+        self.cyclic_b_var = tk.DoubleVar(value=CYCLIC_B_INITIAL)
+        self.cyclic_tol_var = tk.DoubleVar(value=CYCLIC_TOLERANCE)
 
         # cyclic snapshots
         self._last_cyclic = bool(self.cyclic_var.get())
@@ -626,8 +641,8 @@ class DAQMotorApp(tk.Tk):
 
         # --- NEW: Ramp to target controls ---
         self.ramp_var = tk.BooleanVar(value=False)
-        self.ramp_target_var = tk.DoubleVar(value=0.0)
-        self.ramp_time_var = tk.DoubleVar(value=1.0)
+        self.ramp_target_var = tk.DoubleVar(value=RAMP_TARGET_INITIAL)
+        self.ramp_time_var = tk.DoubleVar(value=RAMP_TIME_INITIAL)  # minutes
         # ramp snapshots (for simplified UI read by background thread if needed)
         self._last_ramp = bool(self.ramp_var.get())
         self._last_ramp_target = float(self.ramp_target_var.get())
@@ -690,8 +705,9 @@ class DAQMotorApp(tk.Tk):
         # Simplified MPC controls (minimal setpoint + cyclic) - shown in Simplified mode
         self.simple_mpc_frame = ttk.Frame(self)
         ttk.Label(self.simple_mpc_frame, text="Setpoint (lbf):").grid(row=0, column=0, padx=4, sticky="e")
-        ttk.Entry(self.simple_mpc_frame, width=8, textvariable=self.torque_setpoint_var).grid(row=0, column=1, padx=2)
-        ttk.Checkbutton(self.simple_mpc_frame, text="Enable MPC", variable=self.mpc_enable).grid(row=0, column=2, padx=6)
+        ttk.Checkbutton(self.simple_mpc_frame, text="Enable Setpoint Mode", variable=self.mpc_enable).grid(row=0, column=1, padx=4)
+        ttk.Entry(self.simple_mpc_frame, width=8, textvariable=self.torque_setpoint_var).grid(row=0, column=2, padx=2)
+        
 
         # Cyclic minimal inputs
         ttk.Checkbutton(self.simple_mpc_frame, text="Cyclic (A↔B)", variable=self.cyclic_var,
@@ -968,9 +984,10 @@ class DAQMotorApp(tk.Tk):
                     lbf_disp = volts_to_force_lbf(avg_volts)  # UI only
 
                     # also keep bounded in-memory buffers for plotting
-                    self.voltage_history.append(avg_volts)
-                    self.lbf_history.append(lbf_disp)
-                    self.time_history.append(t - self.graph_start_time)
+                    with self._hist_lock:
+                        self.voltage_history.append(avg_volts)
+                        self.lbf_history.append(lbf_disp)
+                        self.time_history.append(t - self.graph_start_time)
 
                     if self.log_start_time is not None:
                         # keep run-level logs
@@ -1098,27 +1115,20 @@ class DAQMotorApp(tk.Tk):
     def _schedule_plot(self):
         if not self.reading: return
         self.ax.clear()
-        # mode = self.read_mode_var.get()
-        # if mode == "Volts":
-        #     ydata, ylabel, title = self.voltage_history, 'Voltage (V)', 'Live Voltage'
-        # else:
-        #     if mode == "Pounds-Force":
-        #         ydata, ylabel = self.lbf_history, 'Force (lbf)'
-        #     elif mode == "Kilograms":
-        #         ydata, ylabel = [v*0.453592 for v in self.lbf_history], 'Force (kg)'
-        #     else:
-        #         ydata, ylabel = [v*4.448 for v in self.lbf_history], 'Force (N)'
-        #     title = 'Live Force'
-        # self.ax.plot(self.time_history, ydata, lw=2)
-        # self.ax.set_xlabel('Time (s)'); self.ax.set_ylabel(ylabel); self.ax.set_title(title)
-        
-        # Always plot force in pounds-force
-        self.ax.plot(self.time_history, self.lbf_history, lw=2)
+        # Snapshot histories under a lock to avoid length mismatch during concurrent updates
+        try:
+            with self._hist_lock:
+                tlist = list(self.time_history)
+                ylist = list(self.lbf_history)
+        except Exception:
+            tlist, ylist = [], []
+
+        n = min(len(tlist), len(ylist))
+        if n > 0:
+            self.ax.plot(tlist[:n], ylist[:n], lw=2)
         self.ax.set_xlabel('Time (s)')
         self.ax.set_ylabel('Force (lbf)')
         self.ax.set_title('Live Force')
-        
-
         self.canvas.draw()
         self.after(self.update_graph_interval, self._schedule_plot)
 
