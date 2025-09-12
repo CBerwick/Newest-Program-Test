@@ -510,6 +510,52 @@ class DAQMotorApp(tk.Tk):
         self.rdu_var = tk.DoubleVar(value=self.mpc.rdu)
         # Start RLS automatic adjustment UNCHECKED by default on first run
         self.adapt_var = tk.BooleanVar(value=False)
+        # Thread-safe snapshots for MPC params used by background thread
+        self._last_Np = int(self.Np_var.get())
+        self._last_Nu = int(self.Nu_var.get())
+        self._last_qy = float(self.qy_var.get())
+        self._last_rdu = float(self.rdu_var.get())
+        self._last_adapt = bool(self.adapt_var.get())
+        def _trace_Np(*_):
+            try:
+                self._last_Np = int(self.Np_var.get())
+            except Exception:
+                pass
+        def _trace_Nu(*_):
+            try:
+                self._last_Nu = int(self.Nu_var.get())
+            except Exception:
+                pass
+        def _trace_qy(*_):
+            try:
+                self._last_qy = float(self.qy_var.get())
+            except Exception:
+                pass
+        def _trace_rdu(*_):
+            try:
+                self._last_rdu = float(self.rdu_var.get())
+            except Exception:
+                pass
+        def _trace_adapt(*_):
+            try:
+                self._last_adapt = bool(self.adapt_var.get())
+            except Exception:
+                pass
+        try:
+            self.Np_var.trace_add('write', _trace_Np)
+            self.Nu_var.trace_add('write', _trace_Nu)
+            self.qy_var.trace_add('write', _trace_qy)
+            self.rdu_var.trace_add('write', _trace_rdu)
+            self.adapt_var.trace_add('write', _trace_adapt)
+        except Exception:
+            try:
+                self.Np_var.trace('w', _trace_Np)
+                self.Nu_var.trace('w', _trace_Nu)
+                self.qy_var.trace('w', _trace_qy)
+                self.rdu_var.trace('w', _trace_rdu)
+                self.adapt_var.trace('w', _trace_adapt)
+            except Exception:
+                pass
 
         ttk.Checkbutton(self.mpc_frame, text="Enable MPC", variable=self.mpc_enable).grid(row=0, column=0, padx=4)
         ttk.Label(self.mpc_frame, text="Setpoint (lbf):").grid(row=0, column=1, padx=4)
@@ -826,13 +872,14 @@ class DAQMotorApp(tk.Tk):
             self.motor_status_var.set("Ramp: OFF")
 
     def _apply_ramp(self, lbf_raw, t):
-        if not (self.ramp_var.get() and self.mpc_enable.get()):
+        # Use thread-safe snapshots; never call tk .get() from background thread
+        if not (getattr(self, '_last_ramp', False) and getattr(self, '_last_mpc_enable', False)):
             return None
         if self._ramp_start_time is None:
             self._ramp_start_time = t
             self._ramp_start_load = lbf_raw
-            target = float(self.ramp_target_var.get())
-            duration = max(float(self.ramp_time_var.get()) * 60.0, 1e-9)
+            target = float(getattr(self, '_last_ramp_target', 0.0))
+            duration = max(float(getattr(self, '_last_ramp_time', 0.0)) * 60.0, 1e-9)
             self._ramp_target = target
             self._ramp_rate = (target - self._ramp_start_load) / duration
         elapsed = t - self._ramp_start_time
@@ -843,10 +890,11 @@ class DAQMotorApp(tk.Tk):
             done = True
         self.after(0, lambda: self.torque_setpoint_var.set(next_sp))
         if done:
-            self.ramp_var.set(False)
+            # Only touch Tk from main thread
+            self.after(0, lambda: self.ramp_var.set(False))
             msg = f"Ramp complete at {self._ramp_target:.2f} lbf"
-            self._on_ramp_toggle()
-            self.motor_status_var.set(msg)
+            self.after(0, self._on_ramp_toggle)
+            self.after(0, lambda: self.motor_status_var.set(msg))
         return next_sp
 
     # --- DAQ loop ---
@@ -1022,15 +1070,19 @@ class DAQMotorApp(tk.Tk):
                 #     self._id_t.append(self._id_t[-1] + SAMPLE_INTERVAL if self._id_t else 0.0)
                 # in _loop, where you currently call self.mpc.step(...)
                 try:
-                    if self.mnt_ctrl and self.mpc_enable.get():
-                        self.mpc.set_weights(self.Np_var.get(), self.Nu_var.get(),
-                                             self.qy_var.get(), self.rdu_var.get())
-                        if self.adapt_var.get():
+                    if self.mnt_ctrl and getattr(self, '_last_mpc_enable', False):
+                        # Use snapshots for MPC params
+                        self.mpc.set_weights(int(getattr(self, '_last_Np', self.mpc.Np)),
+                                             int(getattr(self, '_last_Nu', self.mpc.Nu)),
+                                             float(getattr(self, '_last_qy', self.mpc.qy)),
+                                             float(getattr(self, '_last_rdu', self.mpc.rdu)))
+                        if getattr(self, '_last_adapt', False):
                             A_new, B_new = self.rls.update(lbf_raw, self.current_rpm)
                             if int(time.time()*10) % 10 == 0:
                                 self.mpc.set_model(SAMPLE_INTERVAL, A_new, B_new, self.mpc.nk)
-                                self.model_lbl.set(self._model_str(A_new, B_new, self.mpc.nk))
-                
+                                # UI update must occur on main thread
+                                self.after(0, lambda: self.model_lbl.set(self._model_str(A_new, B_new, self.mpc.nk)))
+
                         u_cmd = self.mpc.step(y_meas=lbf_raw, r=r_cmd, u_prev=self.current_rpm)
                         self.after(0, self._send_motor_command, u_cmd)
                 except Exception as e:
