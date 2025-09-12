@@ -434,6 +434,11 @@ class DAQMotorApp(tk.Tk):
         # Cyclic state (NEW)
         self._cyclic_target = None   # active numeric target when cyclic is on
         self._cyclic_side = None     # 'A' or 'B'
+        # Cyclic guard (internal): require short dwell and low slope at target
+        self._cyclic_last_switch_t = None
+        self._cyclic_slope_ema = None
+        self._cyclic_dwell_s = 0.7           # seconds within which we avoid re-switching
+        self._cyclic_slope_limit = 8.0       # lbf/s max slope allowed to switch
 
         # Ramp-to-target state (NEW)
         self._ramp_start_time = None
@@ -704,8 +709,8 @@ class DAQMotorApp(tk.Tk):
 
         # Simplified MPC controls (minimal setpoint + cyclic) - shown in Simplified mode
         self.simple_mpc_frame = ttk.Frame(self)
-        ttk.Label(self.simple_mpc_frame, text="Setpoint (lbf):").grid(row=0, column=0, padx=4, sticky="e")
-        ttk.Checkbutton(self.simple_mpc_frame, text="Enable Setpoint Mode", variable=self.mpc_enable).grid(row=0, column=1, padx=4)
+        ttk.Checkbutton(self.simple_mpc_frame, text="Enable Setpoint Mode", variable=self.mpc_enable).grid(row=0, column=0, padx=4)        
+        ttk.Label(self.simple_mpc_frame, text="Setpoint (lbf):").grid(row=0, column=1, padx=4, sticky="e")
         ttk.Entry(self.simple_mpc_frame, width=8, textvariable=self.torque_setpoint_var).grid(row=0, column=2, padx=2)
         
 
@@ -1042,6 +1047,13 @@ class DAQMotorApp(tk.Tk):
                 if ramp_cmd is not None:
                     r_cmd = ramp_cmd
                 elif getattr(self, '_last_cyclic', False) and getattr(self, '_last_mpc_enable', False):
+                    # maintain an EMA of load slope for safe switching
+                    if 'dt' in locals() and dt > 1e-9:
+                        if self._cyclic_slope_ema is None:
+                            self._cyclic_slope_ema = 0.0
+                        inst_slope = (lbf_raw - (self._prev_lbf if hasattr(self, '_prev_lbf') and self._prev_lbf is not None else lbf_raw)) / dt
+                        self._cyclic_slope_ema = 0.8*self._cyclic_slope_ema + 0.2*inst_slope
+                    self._prev_lbf = lbf_raw
                     if self._cyclic_target is None or self._cyclic_side not in ('A','B'):
                         self._cyclic_side = 'A'
                         self._cyclic_target = float(getattr(self, '_last_cyclic_a', self.cyclic_a_var.get()))
@@ -1049,9 +1061,12 @@ class DAQMotorApp(tk.Tk):
                     tol = abs(float(getattr(self, '_last_cyclic_tol', self.cyclic_tol_var.get())))
                     if self._cyclic_side == 'A':
                         a = float(getattr(self, '_last_cyclic_a', self.cyclic_a_var.get()))
-                        if abs(lbf_raw - a) <= tol:
+                        dwell_ok = (self._cyclic_last_switch_t is None) or ((t - self._cyclic_last_switch_t) >= self._cyclic_dwell_s)
+                        slope_ok = (self._cyclic_slope_ema is None) or (abs(self._cyclic_slope_ema) <= self._cyclic_slope_limit)
+                        if abs(lbf_raw - a) <= tol and dwell_ok and slope_ok:
                             self._cyclic_side = 'B'
                             self._cyclic_target = float(getattr(self, '_last_cyclic_b', self.cyclic_b_var.get()))
+                            self._cyclic_last_switch_t = t
                             self.after(0, lambda: self.torque_setpoint_var.set(self._cyclic_target))
                             self.after(0, lambda: self.motor_status_var.set(
                                 f"Cyclic: reached A≈{a:.2f} lbf → switching to B={self._cyclic_target:.2f} lbf"))
@@ -1059,9 +1074,12 @@ class DAQMotorApp(tk.Tk):
                             self._cyclic_target = a
                     else:
                         b = float(getattr(self, '_last_cyclic_b', self.cyclic_b_var.get()))
-                        if abs(lbf_raw - b) <= tol:
+                        dwell_ok = (self._cyclic_last_switch_t is None) or ((t - self._cyclic_last_switch_t) >= self._cyclic_dwell_s)
+                        slope_ok = (self._cyclic_slope_ema is None) or (abs(self._cyclic_slope_ema) <= self._cyclic_slope_limit)
+                        if abs(lbf_raw - b) <= tol and dwell_ok and slope_ok:
                             self._cyclic_side = 'A'
                             self._cyclic_target = float(getattr(self, '_last_cyclic_a', self.cyclic_a_var.get()))
+                            self._cyclic_last_switch_t = t
                             self.after(0, lambda: self.torque_setpoint_var.set(self._cyclic_target))
                             self.after(0, lambda: self.motor_status_var.set(
                                 f"Cyclic: reached B≈{b:.2f} lbf → switching to A={self._cyclic_target:.2f} lbf"))
