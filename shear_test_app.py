@@ -29,6 +29,72 @@ NOTE: All original control logic is intact; the new features only add UI/logic
       around the existing MPC setpoint.
 """
 
+# --- Windows scheduling/timer boost for smoother cyclic control ---
+# Applies when running on Windows unless disabled via env var
+#   set DISABLE_WIN_PERF_BOOST=1
+try:
+    import os as _os
+    if _os.name == "nt" and _os.environ.get("DISABLE_WIN_PERF_BOOST", "0") != "1":
+        import ctypes as _ctypes, atexit as _atexit, sys as _sys
+
+        def _win_perf_boost():
+            kernel32 = _ctypes.windll.kernel32
+            winmm = _ctypes.windll.winmm
+
+            # 1) Raise process priority to HIGH (safer than REALTIME)
+            HIGH_PRIORITY_CLASS = 0x00000080
+            kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), HIGH_PRIORITY_CLASS)
+
+            # 2) Increase system timer resolution to 1 ms
+            #    Helps reduce sleep/select jitter for control loops
+            winmm.timeBeginPeriod(1)
+            _atexit.register(lambda: winmm.timeEndPeriod(1))
+
+            # 3) Disable Windows power throttling for this process (Win10+)
+            class PROCESS_POWER_THROTTLING_STATE(_ctypes.Structure):
+                _fields_ = [
+                    ("Version", _ctypes.c_uint),
+                    ("ControlMask", _ctypes.c_uint),
+                    ("StateMask", _ctypes.c_uint),
+                ]
+
+            ProcessPowerThrottling = 0x00000009
+            PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
+            PROCESS_POWER_THROTTLING_SYSTEM_POLICY = 0x1
+
+            state = PROCESS_POWER_THROTTLING_STATE(
+                PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                PROCESS_POWER_THROTTLING_SYSTEM_POLICY,
+                0,  # disable throttling
+            )
+            try:
+                kernel32.SetProcessInformation(
+                    kernel32.GetCurrentProcess(),
+                    ProcessPowerThrottling,
+                    _ctypes.byref(state),
+                    _ctypes.sizeof(state),
+                )
+            except Exception:
+                # Older Windows may not support this API
+                pass
+
+            # 4) Nudge the current thread priority higher (not time-critical)
+            THREAD_PRIORITY_ABOVE_NORMAL = 1  # HIGHEST=2, TIME_CRITICAL=15
+            try:
+                kernel32.SetThreadPriority(
+                    kernel32.GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL
+                )
+            except Exception:
+                pass
+
+        try:
+            _win_perf_boost()
+        except Exception as _e:
+            print(f"[perf boost] non-fatal: {_e}", file=_sys.stderr)
+except Exception:
+    # If anything goes wrong here, fail open without affecting the app
+    pass
+
 import tkinter as tk
 from tkinter import ttk, filedialog
 import threading, time, math, json, random, os, sqlite3, queue
