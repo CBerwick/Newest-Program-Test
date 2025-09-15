@@ -31,116 +31,9 @@ NOTE: All original control logic is intact; the new features only add UI/logic
 
 import tkinter as tk
 from tkinter import ttk, filedialog
-import threading, time, math, json, random, os, sqlite3, queue, gc
-import multiprocessing as mp
+import threading, time, math, json, random, os, sqlite3, queue
 from collections import deque
 import numpy as np
-import ctypes
-try:
-    import psutil
-except Exception:
-    psutil = None
-
-
-def _db_writer_process_main(q, db_path, max_bytes):
-    """Process target: consumes rows from a multiprocessing.Queue and writes
-    them to a SQLite DB. Uses a sentinel of None to stop. Lowers its own
-    process priority on Windows to reduce interference with the DAQ process.
-    """
-    import sqlite3, os, time, ctypes
-    # Lower process priority (best-effort) on Windows
-    try:
-        if os.name == 'nt':
-            HANDLE = ctypes.windll.kernel32.GetCurrentProcess()
-            BELOW = 0x00004000  # BELOW_NORMAL_PRIORITY_CLASS
-            ctypes.windll.kernel32.SetPriorityClass(HANDLE, BELOW)
-    except Exception:
-        pass
-
-    try:
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        cur = conn.cursor()
-        cur.execute('''CREATE TABLE IF NOT EXISTS readings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL,
-            voltage REAL,
-            force_lbf REAL,
-            mass_kg REAL,
-            rpm REAL
-        )''')
-        conn.commit()
-    except Exception:
-        # If DB open fails, drain the queue until sentinel then exit
-        while True:
-            try:
-                item = q.get()
-            except Exception:
-                break
-            if item is None:
-                break
-        return
-
-    rotate_count = 0
-    while True:
-        try:
-            item = q.get()
-        except Exception:
-            # Queue closed/unavailable; exit
-            break
-        if item is None:
-            break
-        try:
-            ts, volts, force_lbf, mass_kg, rpm = item
-            cur.execute('INSERT INTO readings (timestamp, voltage, force_lbf, mass_kg, rpm) VALUES (?, ?, ?, ?, ?)',
-                        (ts, volts, force_lbf, mass_kg, rpm))
-        except Exception:
-            pass
-
-        # periodic commit
-        try:
-            if int(time.time()) % 2 == 0:
-                conn.commit()
-        except Exception:
-            pass
-
-        # rotation
-        try:
-            if db_path and os.path.isfile(db_path) and os.path.getsize(db_path) > max_bytes:
-                try:
-                    conn.commit()
-                except Exception:
-                    pass
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                rotate_count += 1
-                base_dir = os.path.dirname(db_path)
-                base_name = os.path.splitext(os.path.basename(db_path))[0]
-                new_name = f"{base_name}.part{rotate_count}.db"
-                db_path = os.path.join(base_dir, new_name)
-                try:
-                    conn = sqlite3.connect(db_path, check_same_thread=False)
-                    cur = conn.cursor()
-                    cur.execute('''CREATE TABLE IF NOT EXISTS readings (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        timestamp REAL,
-                        voltage REAL,
-                        force_lbf REAL,
-                        mass_kg REAL,
-                        rpm REAL
-                    )''')
-                    conn.commit()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    try:
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass
 
 # ------------- Optional QP solver (recommended). Fallback is analytic LS. ------------- 
 try:
@@ -489,10 +382,11 @@ class DAQMotorApp(tk.Tk):
         self.log_mass_kg = deque(maxlen=MAX_IN_MEMORY)
         self.log_force_lbf = deque(maxlen=MAX_IN_MEMORY)
 
-        # Persistent logging (SQLite writer) -- use multiprocessing to isolate I/O
+        # Persistent logging (SQLite writer)
         self._db_conn = None
-        self._db_queue = None  # will be multiprocessing.Queue
-        self._db_writer_proc = None
+        self._db_queue = queue.Queue()
+        self._db_writer_thread = None
+        self._db_stop_event = threading.Event()
         self._db_path = None
         # DB rotation config (size in bytes). 200 MB default.
         self._db_max_bytes = 200 * 1024 * 1024
@@ -563,60 +457,6 @@ class DAQMotorApp(tk.Tk):
         self.bind("<F12>", lambda e: self._toggle_mode())
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-    # --- Priority control (Windows only) ---
-    # A user can opt-in to raise process priority. This is safe by
-    # default (HIGH not REALTIME) and also attempts to lower the DB
-    # writer thread priority so I/O/committing doesn't interfere.
-    self.priority_var = tk.BooleanVar(value=False)
-
-    # --- Windows priority helpers ---
-    def _set_process_high_priority(self):
-        # Try to set process to HIGH_PRIORITY_CLASS (not REALTIME). No-op on non-Windows.
-        if os.name != 'nt':
-            return False
-        try:
-            PROCESS_SET_INFORMATION = 0x0200
-            HANDLE = ctypes.windll.kernel32.GetCurrentProcess()
-            HIGH = 0x00000080  # HIGH_PRIORITY_CLASS
-            ctypes.windll.kernel32.SetPriorityClass(HANDLE, HIGH)
-            return True
-        except Exception:
-            return False
-
-    def _set_process_normal_priority(self):
-        if os.name != 'nt':
-            return False
-        try:
-            HANDLE = ctypes.windll.kernel32.GetCurrentProcess()
-            NORMAL = 0x00000020  # NORMAL_PRIORITY_CLASS
-            ctypes.windll.kernel32.SetPriorityClass(HANDLE, NORMAL)
-            return True
-        except Exception:
-            return False
-
-    def _set_thread_low_priority(self, thread_ident):
-        # Attempt to set a thread's priority lower to reduce interference.
-        if os.name != 'nt' or thread_ident is None:
-            return False
-        try:
-            # OpenThread & SetThreadPriority via ctypes
-            THREAD_SET_INFORMATION = 0x0020
-            THREAD_QUERY_INFORMATION = 0x0040
-            # OpenThread expects DWORD thread id
-            OpenThread = ctypes.windll.kernel32.OpenThread
-            SetThreadPriority = ctypes.windll.kernel32.SetThreadPriority
-            CloseHandle = ctypes.windll.kernel32.CloseHandle
-            THREAD_PRIORITY_BELOW_NORMAL = -1
-            handle = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, False, int(thread_ident))
-            if not handle:
-                return False
-            res = SetThreadPriority(handle, THREAD_PRIORITY_BELOW_NORMAL)
-            CloseHandle(handle)
-            return bool(res)
-        except Exception:
-            return False
-
-
     # --- GUI ---
     def _build_gui(self):
         # ── Top toolbar: Mode switch (NEW) ─────────────────────────────────────
@@ -627,11 +467,6 @@ class DAQMotorApp(tk.Tk):
         ttk.Radiobutton(self.toolbar, text="Developer", value="Developer",
                         variable=self.mode_var, command=self._apply_mode).pack(side=tk.LEFT, padx=2)
         ttk.Label(self.toolbar, text="(Press F12 to toggle)").pack(side=tk.LEFT, padx=10)
-        # Priority toggle (Windows): opt-in to raise process priority
-        try:
-            ttk.Checkbutton(self.toolbar, text="High priority (opt-in)", variable=self.priority_var).pack(side=tk.RIGHT, padx=6)
-        except Exception:
-            pass
 
         # Display unit selector (DEV)
         # Only pounds-force is supported; other units have been removed.
@@ -1171,26 +1006,6 @@ class DAQMotorApp(tk.Tk):
         db_fname = f'readings_{ts}.db'
         self._db_path = os.path.join(logs_dir, db_fname)
         self._start_db_writer(self._db_path)
-        # Optionally disable GC during the DAQ run to reduce small pauses
-        try:
-            if self.priority_var.get():
-                try:
-                    gc.disable()
-                    self._gc_disabled_for_run = True
-                except Exception:
-                    self._gc_disabled_for_run = False
-        except Exception:
-            self._gc_disabled_for_run = False
-        # If requested, try to raise process priority (Windows only)
-        try:
-            if os.name == 'nt' and self.priority_var.get():
-                ok = self._set_process_high_priority()
-                if ok:
-                    self.motor_status_var.set('Process priority: HIGH')
-                else:
-                    self.motor_status_var.set('Process priority: request failed')
-        except Exception:
-            pass
         self.reading = True
         self.read_thread = threading.Thread(target=self._loop, daemon=True)
         self.read_thread.start()
@@ -1205,16 +1020,6 @@ class DAQMotorApp(tk.Tk):
             self.daq.stop()
         # Stop DB writer (flush remaining rows) before prompting save
         self._stop_db_writer()
-        # Re-enable GC if we disabled it for the run
-        try:
-            if getattr(self, '_gc_disabled_for_run', False):
-                try:
-                    gc.enable()
-                except Exception:
-                    pass
-                self._gc_disabled_for_run = False
-        except Exception:
-            pass
         self._prompt_save_data()
         # Clear the graph so a new run starts fresh
         self.lbf_history.clear()
@@ -1265,11 +1070,7 @@ class DAQMotorApp(tk.Tk):
 
                         # enqueue to persistent DB after values computed
                         try:
-                            if self._db_queue is not None:
-                                # multiprocessing.Queue supports put_nowait
-                                self._db_queue.put_nowait((t, float(volts), float(lbf_disp), float(lbf_disp/2.20462), float(self.current_rpm)))
-                            else:
-                                raise RuntimeError('DB queue not available')
+                            self._db_queue.put_nowait((t, float(volts), float(lbf_disp), float(lbf_disp/2.20462), float(self.current_rpm)))
                         except Exception:
                             # queue full or stopped; surface status but keep running
                             try:
@@ -1778,43 +1579,50 @@ class DAQMotorApp(tk.Tk):
     # --- Persistent DB writer management ---
     def _start_db_writer(self, db_path):
         try:
-            # Create a multiprocessing queue and process to handle DB I/O
-            mp.set_start_method('spawn', force=False)
-        except Exception:
-            # ignore if already set
-            pass
-        try:
-            q = mp.Queue(maxsize=10000)
-            p = mp.Process(target=_db_writer_process_main, args=(q, db_path, self._db_max_bytes), daemon=True)
-            p.start()
-            self._db_queue = q
-            self._db_writer_proc = p
+            # Open DB and create table
+            conn = sqlite3.connect(db_path, check_same_thread=False)
+            cur = conn.cursor()
+            cur.execute('''CREATE TABLE IF NOT EXISTS readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL,
+                voltage REAL,
+                force_lbf REAL,
+                mass_kg REAL,
+                rpm REAL
+            )''')
+            conn.commit()
+            self._db_conn = conn
             self._db_path = db_path
             self._db_rotate_count = 0
+
+            # Start writer thread
+            self._db_stop_event.clear()
+            t = threading.Thread(target=self._db_writer_loop, daemon=True)
+            self._db_writer_thread = t
+            t.start()
         except Exception as e:
             self.motor_status_var.set(f'DB writer start failed: {e}')
 
     def _stop_db_writer(self):
-        # Signal process stop and wait for queue to flush
+        # Signal stop and wait for queue to flush
         try:
-            if self._db_writer_proc is None:
+            if self._db_writer_thread is None:
                 return
-            # send sentinel
-            try:
-                if self._db_queue is not None:
-                    self._db_queue.put_nowait(None)
-            except Exception:
-                pass
-            # wait for process to exit
-            self._db_writer_proc.join(timeout=5.0)
-            try:
-                if self._db_writer_proc.is_alive():
-                    self._db_writer_proc.terminate()
-            except Exception:
-                pass
-            self._db_writer_proc = None
-            self._db_queue = None
-            self._db_path = None
+            self._db_stop_event.set()
+            # wait until queue empty or timeout
+            start = time.time()
+            while not self._db_queue.empty() and (time.time() - start) < 5.0:
+                time.sleep(0.05)
+            # join thread
+            self._db_writer_thread.join(timeout=2.0)
+            if self._db_conn:
+                try:
+                    self._db_conn.commit()
+                    self._db_conn.close()
+                except Exception:
+                    pass
+            self._db_writer_thread = None
+            self._db_conn = None
         except Exception:
             pass
 
@@ -1899,15 +1707,7 @@ class DAQMotorApp(tk.Tk):
             else:
                 name = 'none'
             self.db_status_var.set(f"DB: {name}")
-            # multiprocessing.Queue.qsize may be unsupported on some platforms
-            try:
-                qlen = self._db_queue.qsize() if self._db_queue is not None else 0
-            except Exception:
-                try:
-                    # fallback: non-blocking approximate size by draining and re-enqueueing is unsafe here
-                    qlen = 0
-                except Exception:
-                    qlen = 0
+            qlen = self._db_queue.qsize() if self._db_queue is not None else 0
             self.db_queue_var.set(f"Queue: {qlen}")
         except Exception:
             pass
