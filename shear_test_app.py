@@ -31,9 +31,14 @@ NOTE: All original control logic is intact; the new features only add UI/logic
 
 import tkinter as tk
 from tkinter import ttk, filedialog
-import threading, time, math, json, random, os, sqlite3, queue
+import threading, time, math, json, random, os, sqlite3, queue, gc
 from collections import deque
 import numpy as np
+import ctypes
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 # ------------- Optional QP solver (recommended). Fallback is analytic LS. ------------- 
 try:
@@ -457,6 +462,60 @@ class DAQMotorApp(tk.Tk):
         self.bind("<F12>", lambda e: self._toggle_mode())
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
+    # --- Priority control (Windows only) ---
+    # A user can opt-in to raise process priority. This is safe by
+    # default (HIGH not REALTIME) and also attempts to lower the DB
+    # writer thread priority so I/O/committing doesn't interfere.
+    self.priority_var = tk.BooleanVar(value=False)
+
+    # --- Windows priority helpers ---
+    def _set_process_high_priority(self):
+        # Try to set process to HIGH_PRIORITY_CLASS (not REALTIME). No-op on non-Windows.
+        if os.name != 'nt':
+            return False
+        try:
+            PROCESS_SET_INFORMATION = 0x0200
+            HANDLE = ctypes.windll.kernel32.GetCurrentProcess()
+            HIGH = 0x00000080  # HIGH_PRIORITY_CLASS
+            ctypes.windll.kernel32.SetPriorityClass(HANDLE, HIGH)
+            return True
+        except Exception:
+            return False
+
+    def _set_process_normal_priority(self):
+        if os.name != 'nt':
+            return False
+        try:
+            HANDLE = ctypes.windll.kernel32.GetCurrentProcess()
+            NORMAL = 0x00000020  # NORMAL_PRIORITY_CLASS
+            ctypes.windll.kernel32.SetPriorityClass(HANDLE, NORMAL)
+            return True
+        except Exception:
+            return False
+
+    def _set_thread_low_priority(self, thread_ident):
+        # Attempt to set a thread's priority lower to reduce interference.
+        if os.name != 'nt' or thread_ident is None:
+            return False
+        try:
+            # OpenThread & SetThreadPriority via ctypes
+            THREAD_SET_INFORMATION = 0x0020
+            THREAD_QUERY_INFORMATION = 0x0040
+            # OpenThread expects DWORD thread id
+            OpenThread = ctypes.windll.kernel32.OpenThread
+            SetThreadPriority = ctypes.windll.kernel32.SetThreadPriority
+            CloseHandle = ctypes.windll.kernel32.CloseHandle
+            THREAD_PRIORITY_BELOW_NORMAL = -1
+            handle = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, False, int(thread_ident))
+            if not handle:
+                return False
+            res = SetThreadPriority(handle, THREAD_PRIORITY_BELOW_NORMAL)
+            CloseHandle(handle)
+            return bool(res)
+        except Exception:
+            return False
+
+
     # --- GUI ---
     def _build_gui(self):
         # ── Top toolbar: Mode switch (NEW) ─────────────────────────────────────
@@ -467,6 +526,11 @@ class DAQMotorApp(tk.Tk):
         ttk.Radiobutton(self.toolbar, text="Developer", value="Developer",
                         variable=self.mode_var, command=self._apply_mode).pack(side=tk.LEFT, padx=2)
         ttk.Label(self.toolbar, text="(Press F12 to toggle)").pack(side=tk.LEFT, padx=10)
+        # Priority toggle (Windows): opt-in to raise process priority
+        try:
+            ttk.Checkbutton(self.toolbar, text="High priority (opt-in)", variable=self.priority_var).pack(side=tk.RIGHT, padx=6)
+        except Exception:
+            pass
 
         # Display unit selector (DEV)
         # Only pounds-force is supported; other units have been removed.
@@ -1006,6 +1070,26 @@ class DAQMotorApp(tk.Tk):
         db_fname = f'readings_{ts}.db'
         self._db_path = os.path.join(logs_dir, db_fname)
         self._start_db_writer(self._db_path)
+        # Optionally disable GC during the DAQ run to reduce small pauses
+        try:
+            if self.priority_var.get():
+                try:
+                    gc.disable()
+                    self._gc_disabled_for_run = True
+                except Exception:
+                    self._gc_disabled_for_run = False
+        except Exception:
+            self._gc_disabled_for_run = False
+        # If requested, try to raise process priority (Windows only)
+        try:
+            if os.name == 'nt' and self.priority_var.get():
+                ok = self._set_process_high_priority()
+                if ok:
+                    self.motor_status_var.set('Process priority: HIGH')
+                else:
+                    self.motor_status_var.set('Process priority: request failed')
+        except Exception:
+            pass
         self.reading = True
         self.read_thread = threading.Thread(target=self._loop, daemon=True)
         self.read_thread.start()
@@ -1020,6 +1104,16 @@ class DAQMotorApp(tk.Tk):
             self.daq.stop()
         # Stop DB writer (flush remaining rows) before prompting save
         self._stop_db_writer()
+        # Re-enable GC if we disabled it for the run
+        try:
+            if getattr(self, '_gc_disabled_for_run', False):
+                try:
+                    gc.enable()
+                except Exception:
+                    pass
+                self._gc_disabled_for_run = False
+        except Exception:
+            pass
         self._prompt_save_data()
         # Clear the graph so a new run starts fresh
         self.lbf_history.clear()
@@ -1600,6 +1694,16 @@ class DAQMotorApp(tk.Tk):
             t = threading.Thread(target=self._db_writer_loop, daemon=True)
             self._db_writer_thread = t
             t.start()
+            # If on Windows and high priority requested, try to reduce writer thread priority
+            try:
+                if os.name == 'nt' and self.priority_var.get():
+                    # Best-effort: lower the writer thread priority so it doesn't preempt DAQ
+                    try:
+                        self._set_thread_low_priority(t.ident)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except Exception as e:
             self.motor_status_var.set(f'DB writer start failed: {e}')
 
