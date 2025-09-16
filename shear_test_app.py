@@ -1027,13 +1027,31 @@ class DAQMotorApp(tk.Tk):
 
     def _apply_ramp(self, lbf_raw, t):
         # Use thread-safe snapshots; never call tk .get() from background thread
-        if not (getattr(self, '_last_ramp', False) and getattr(self, '_last_mpc_enable', False)):
+        ramp_enabled = getattr(self, '_last_ramp', False)
+        mpc_enabled = getattr(self, '_last_mpc_enable', False)
+        if not (ramp_enabled and mpc_enabled) and threading.current_thread() is threading.main_thread():
+            try:
+                ramp_enabled = bool(self.ramp_var.get())
+                mpc_enabled = bool(self.mpc_enable.get())
+            except Exception:
+                pass
+        if not (ramp_enabled and mpc_enabled):
             return None
         if self._ramp_start_time is None:
             self._ramp_start_time = t
             self._ramp_start_load = lbf_raw
-            target = float(getattr(self, '_last_ramp_target', 0.0))
-            duration = max(float(getattr(self, '_last_ramp_time', 0.0)) * 60.0, 1e-9)
+            target = getattr(self, '_last_ramp_target', 0.0)
+            duration_min = getattr(self, '_last_ramp_time', 0.0)
+            if threading.current_thread() is threading.main_thread():
+                try:
+                    target = float(self.ramp_target_var.get())
+                    duration_min = float(self.ramp_time_var.get())
+                    self._last_ramp_target = target
+                    self._last_ramp_time = duration_min
+                except Exception:
+                    pass
+            target = float(target)
+            duration = max(float(duration_min) * 60.0, 1e-9)
             self._ramp_target = target
             self._ramp_rate = (target - self._ramp_start_load) / duration
         elapsed = t - self._ramp_start_time
